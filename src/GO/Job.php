@@ -2,6 +2,8 @@
 
 use DateTime;
 use Exception;
+use GO\Method\CallUserFunction;
+use GO\Method\ExecuteShellCommand;
 use InvalidArgumentException;
 
 class Job
@@ -89,11 +91,11 @@ class Job
     private $returnCode = 0;
 
     /**
-     * Files to write the output of the job.
+     * Files to write the output of the job (STDOUT by default).
      *
      * @var array
      */
-    private $outputTo = [];
+    private $outputTo = ['php://stdout'];
 
     /**
      * Email addresses where the output should be sent to.
@@ -204,8 +206,8 @@ class Job
     public function isOverlapping()
     {
         return $this->lockFile &&
-               file_exists($this->lockFile) &&
-               call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
+            file_exists($this->lockFile) &&
+            call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
     }
 
     /**
@@ -288,17 +290,6 @@ class Job
             }
         }
 
-        // Add the boilerplate to redirect the output to file/s
-        if (count($this->outputTo) > 0) {
-            $compiled .= ' | tee ';
-            $compiled .= $this->outputMode === 'a' ? '-a ' : '';
-            foreach ($this->outputTo as $file) {
-                $compiled .= $file . ' ';
-            }
-
-            $compiled = trim($compiled);
-        }
-
         // Add boilerplate to remove lockfile after execution
         if ($this->lockFile) {
             $compiled .= '; rm ' . $this->lockFile;
@@ -308,7 +299,7 @@ class Job
         if ($this->canRunInBackground()) {
             // Parentheses are need execute the chain of commands in a subshell
             // that can then run in background
-            $compiled = '(' . $compiled . ') > /dev/null 2>&1 &';
+            $compiled = '(' . $compiled . ') &';
         }
 
         return trim($compiled);
@@ -357,32 +348,42 @@ class Job
      */
     public function run()
     {
-        // If the truthTest failed, don't run
         if ($this->truthTest !== true) {
             return false;
         }
 
-        // If overlapping, don't run
         if ($this->isOverlapping()) {
             return false;
         }
 
-        $compiled = $this->compile();
+        try {
+            $compiled = $this->compile();
+            $this->createLockFile();
 
-        // Write lock file if necessary
-        $this->createLockFile();
+            if (is_callable($this->before)) {
+                call_user_func($this->before);
+            }
 
-        if (is_callable($this->before)) {
-            call_user_func($this->before);
+            $method = null;
+            if (is_callable($compiled)) {
+                $method = new CallUserFunction();
+            } else {
+                $method = new ExecuteShellCommand();
+            }
+            $this->output = $method->execute($compiled, $this->args);
+
+            if (!empty($this->output)) {
+                foreach ($this->outputTo as $filename) {
+                    file_put_contents($filename, $this->output, $this->outputMode === 'a' ? FILE_APPEND : 0);
+                }
+            }
+
+            $this->finalise();
+        } catch (Exception $e) {
+            echo sprintf("Job %s failed with an error: %s\n", $this->id, $e->getMessage());
+        } finally {
+            $this->removeLockFile();
         }
-
-        if (is_callable($compiled)) {
-            $this->output = $this->exec($compiled);
-        } else {
-            exec($compiled, $this->output, $this->returnCode);
-        }
-
-        $this->finalise();
 
         return true;
     }
@@ -414,41 +415,6 @@ class Job
         if ($this->lockFile && file_exists($this->lockFile)) {
             unlink($this->lockFile);
         }
-    }
-
-    /**
-     * Execute a callable job.
-     *
-     * @param  callable  $fn
-     * @throws Exception
-     * @return string
-     */
-    private function exec(callable $fn)
-    {
-        ob_start();
-
-        try {
-            $returnData = call_user_func_array($fn, $this->args);
-        } catch (Exception $e) {
-            ob_end_clean();
-            throw $e;
-        }
-
-        $outputBuffer = ob_get_clean();
-
-        foreach ($this->outputTo as $filename) {
-            if ($outputBuffer) {
-                file_put_contents($filename, $outputBuffer, $this->outputMode === 'a' ? FILE_APPEND : 0);
-            }
-
-            if ($returnData) {
-                file_put_contents($filename, $returnData, FILE_APPEND);
-            }
-        }
-
-        $this->removeLockFile();
-
-        return $outputBuffer . (is_string($returnData) ? $returnData : '');
     }
 
     /**
