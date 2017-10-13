@@ -23,6 +23,10 @@ class CallUserFunction implements CommandExecutionInterface
 
         $outputBuffer = ob_get_clean();
 
+        if (is_array($returnData)) {
+            $returnData = implode("\n", $returnData) . "\n";
+        }
+
         return $outputBuffer . (is_string($returnData) ? $returnData : '');
     }
 }
